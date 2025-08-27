@@ -235,53 +235,65 @@ class CICIDSPredictor:
         self.model = tf.keras.models.load_model(model_path)
         self.le = joblib_load(label_encoder_path)
 
-    def predict(self, X: np.ndarray, time_steps=1):
+    def predict(self, X: np.ndarray):
         """
         X: (N, D) numeric features
         Returns: list of string labels of length N
+        Handles LSTM/BiLSTM models expecting 3D input (batch_size, timesteps, features)
         """
         if X.ndim != 2:
             raise ValueError("X must be 2D (N, D)")
 
-        # Detect model expected input shape robustly (works if .inputs shapes return TensorShape OR tuples)
+        # Detect model expected input shape robustly
         model_inputs = getattr(self.model, "inputs", None)
         X_in = X
         if model_inputs:
             try:
-                # obtain first input's shape - robustly handle TensorShape or tuple/list
                 shape_obj = model_inputs[0].shape
                 if hasattr(shape_obj, "as_list"):
-                    ref_shape = shape_obj.as_list()  # list like [None, timesteps, features] or [None, features]
+                    ref_shape = shape_obj.as_list()  # e.g., [None, timesteps, features]
                 else:
-                    # shape_obj could be a tuple; convert to list
                     ref_shape = list(shape_obj)
             except Exception:
                 ref_shape = None
 
-            # If model wants sequences (3D) and features dimension matches last dim, add axis
             if isinstance(ref_shape, list) and len(ref_shape) == 3:
-                # common forms: [None, timesteps, features] or [None, None, features]
-                # if timesteps is 1 or None -> we can reshape to (N, timesteps, D) using timesteps=1
-                timesteps = ref_shape[1]
-                features_expected = ref_shape[2]
-                # if last dim matches or is None, reshape
-                if features_expected in (None, X.shape[1]) or features_expected == X.shape[1]:
-                    # reshape to (N, timesteps, features)
-                    # choose timesteps=1 if model expects None or 1
-                    t = 1 if (timesteps is None or timesteps == 1) else timesteps
-                    X_in = X.reshape((X.shape[0], t, X.shape[1]))
+                timesteps = ref_shape[1] or 1
+                features_expected = ref_shape[2] or X.shape[1]
+
+                if features_expected != X.shape[1]:
+                    raise ValueError(f"Model expects {features_expected} features, got {X.shape[1]}")
+
+                N, D = X.shape
+                if N < timesteps:
+                    # pad by repeating last row
+                    pad = np.repeat(X[-1:, :], timesteps - N, axis=0)
+                    X_in = np.vstack([X, pad]).reshape((1, timesteps, D))
+                elif N % timesteps == 0:
+                    X_in = X.reshape((N // timesteps, timesteps, D))
+                else:
+                    # pad to next multiple of timesteps
+                    extra = timesteps - (N % timesteps)
+                    pad = np.repeat(X[-1:, :], extra, axis=0)
+                    X_in = np.vstack([X, pad]).reshape(((N + extra) // timesteps, timesteps, D))
             else:
-                # keep X as-is (2D) for dense models
+                # Dense model, keep 2D
                 X_in = X
 
         # final prediction
         probs = self.model.predict(X_in, verbose=0)
+        if probs.ndim == 3:
+            # reshape 3D output to (N, num_classes)
+            probs = probs.reshape((probs.shape[0] * probs.shape[1], -1))
         if probs.ndim == 2:
             idx = np.argmax(probs, axis=1)
         elif probs.ndim == 1:
             idx = (probs > 0.5).astype(int)
         else:
             idx = np.argmax(probs.reshape((probs.shape[0], -1)), axis=1)
+
+        # trim padding if any
+        idx = idx[:X.shape[0]]
 
         return self.le.inverse_transform(idx)
 
