@@ -24,6 +24,25 @@ except Exception:
 import requests
 import warnings
 warnings.filterwarnings("ignore")
+
+from colorama import Fore, Style, init
+init(autoreset=True)
+
+# Define label -> color mapping
+LABEL_COLORS = {
+    "Normal": Fore.GREEN,
+    "Reconnaissance": Fore.YELLOW,
+    "Backdoor": Fore.RED,
+    "DoS": Fore.RED,
+    "Exploits": Fore.MAGENTA,
+    "Analysis": Fore.CYAN,
+    "Fuzzers": Fore.BLUE,
+    "Worms": Fore.LIGHTRED_EX,
+    "Shellcode": Fore.LIGHTMAGENTA_EX,
+    "Generic": Fore.LIGHTCYAN_EX,
+    "Unknown": Fore.WHITE
+}
+
 # -----------------------
 # Config
 # -----------------------
@@ -401,7 +420,13 @@ def inference_thread(batch_q: queue.Queue, preproc: Preprocessor, predictor: Pre
         if print_labels and view is not None:
             out = view.copy()
             out["pred_label"] = y_labels
-            print(out.head(20).to_string(index=False))
+
+            # Colorize output
+            for _, row in out.head(20).iterrows():
+                label = row["pred_label"]
+                color = LABEL_COLORS.get(label, Fore.WHITE)
+                print(f"[predict] {row['src']:>15}:{row['sport']:<5} -> {row['dst']:>15}:{row['dport']:<5} "
+                    f"[{row['proto']}]  {color}{label}{Style.RESET_ALL}")
         else:
             print(f"[predict] batch size={len(y_labels)}")
 

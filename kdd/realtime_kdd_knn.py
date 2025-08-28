@@ -4,6 +4,17 @@ from scapy.all import sniff, IP, TCP, UDP
 import joblib
 from collections import defaultdict, deque
 import time
+from colorama import Fore, Style, init
+init(autoreset=True)
+
+LABEL_COLORS = {
+    "normal": Fore.GREEN,
+    "dos": Fore.RED,
+    "probe": Fore.YELLOW,
+    "r2l": Fore.MAGENTA,
+    "u2r": Fore.CYAN,
+    "unknown": Fore.WHITE
+}
 
 # =====================
 # 1. Load model and preprocessing
@@ -108,7 +119,9 @@ def predict_packet(pkt):
     # Predict
     y_pred_enc = knn.predict(df_scaled)
     y_pred = label_encoder.inverse_transform(y_pred_enc)
-    print(f"Flow {flow_key} predicted attack category: {y_pred[0]}")
+    label = y_pred[0]
+    color = LABEL_COLORS.get(label.lower(), Fore.WHITE)
+    print(f"Flow {flow_key} predicted attack category: {color}{label}{Style.RESET_ALL}")
 
 # =====================
 # 5. Start sniffing

@@ -4,11 +4,25 @@ from scapy.all import sniff, IP, TCP, UDP
 from collections import defaultdict, deque
 import joblib
 import warnings
+from colorama import Fore, Style, init  # ✅ add colorama
 
 warnings.filterwarnings("ignore")
 
 # =====================
-# 1. Load Random Forest & Preprocessing
+# 1. Init colorama
+# =====================
+init(autoreset=True)
+LABEL_COLORS = {
+    "normal": Fore.GREEN,
+    "dos": Fore.RED,
+    "probe": Fore.YELLOW,
+    "r2l": Fore.MAGENTA,
+    "u2r": Fore.CYAN,
+    "unknown": Fore.WHITE
+}
+
+# =====================
+# 2. Load Random Forest & Preprocessing
 # =====================
 rf_model = joblib.load("rf_model_rfe.pkl")
 rfe_selector = joblib.load("rfe_selector.pkl")
@@ -20,12 +34,12 @@ categorical_cols = ["protocol_type", "service", "flag"]
 attack_map = ['normal', 'dos', 'probe', 'r2l', 'u2r']
 
 # =====================
-# 2. Flow tracker
+# 3. Flow tracker
 # =====================
 flows = defaultdict(lambda: deque(maxlen=1000))
 
 # =====================
-# 3. Compute flow features (simplified for live capture)
+# 4. Compute flow features (simplified for live capture)
 # =====================
 def compute_flow_features(flow_packets):
     if not flow_packets:
@@ -83,20 +97,18 @@ def compute_flow_features(flow_packets):
     return features
 
 # =====================
-# 4. Preprocess features for RF
+# 5. Preprocess features for RF
 # =====================
 def preprocess_rf(df):
-    # Encode categorical features
     df['protocol_type'] = le_protocol.transform(df['protocol_type'])
     df['service']       = le_service.transform(df['service'])
     df['flag']          = le_flag.transform(df['flag'])
 
-    # Apply RFE selection
     X_rfe = rfe_selector.transform(df)
     return X_rfe
 
 # =====================
-# 5. Predict callback
+# 6. Predict callback
 # =====================
 def predict_packet(pkt):
     try:
@@ -113,15 +125,16 @@ def predict_packet(pkt):
         df = pd.DataFrame([features])
         X_rfe = preprocess_rf(df)
         y_pred_enc = rf_model.predict(X_rfe)
-        y_pred = attack_map[y_pred_enc[0]]
+        label = attack_map[y_pred_enc[0]]
 
-        print(f"[PREDICTION] Flow {flow_key} => {y_pred}")
+        color = LABEL_COLORS.get(label.lower(), Fore.WHITE)
+        print(f"Flow {flow_key} predicted attack category: {color}{label}{Style.RESET_ALL}")
 
     except Exception as e:
         print(f"[ERROR] {e}")
 
 # =====================
-# 6. Start sniffing
+# 7. Start sniffing
 # =====================
 print("[INFO] Starting real-time KDD packet sniffing...")
 sniff(iface="Wi-Fi", prn=predict_packet, store=False)

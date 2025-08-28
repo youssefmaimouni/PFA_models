@@ -7,6 +7,8 @@ from tensorflow.keras.models import load_model
 import warnings
 
 warnings.filterwarnings("ignore")
+from colorama import Fore, Style, init
+init(autoreset=True)
 
 # =====================
 # 1. Load models
@@ -124,7 +126,7 @@ def preprocess_features(df):
 # =====================
 # 5. Predict callback
 # =====================
-attack_map = ['normal','dos','probe','r2l','u2r']
+attack_map = ['probe','dos','normal','r2l','u2r']
 
 def predict_packet(pkt):
     try:
@@ -144,10 +146,18 @@ def predict_packet(pkt):
         y_pred_enc = rf_model.predict(encoded)
         y_pred = attack_map[y_pred_enc[0]]
 
-        print(f"[PREDICTION] Flow {flow_key} => {y_pred}")
+        # Colored output
+        if y_pred == "normal":
+            color = Fore.GREEN
+        elif y_pred in ["dos", "probe"]:
+            color = Fore.YELLOW
+        else:  # r2l, u2r
+            color = Fore.RED
+
+        print(f"[PREDICTION] Flow {flow_key} => {color}{y_pred}{Style.RESET_ALL}")
 
     except Exception as e:
-        print(f"[ERROR] {e}")
+        print(f"{Fore.RED}[ERROR] {e}{Style.RESET_ALL}")
 
 # =====================
 # 6. Start sniffing
