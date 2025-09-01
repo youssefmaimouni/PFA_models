@@ -1,446 +1,168 @@
-# realtime_ids.py
-# Sniffer -> Flows -> Features -> Preprocess (encoder/scaler) -> Predict (local or Azure)
-
-import argparse
+#!/usr/bin/env python3
 import time
 import threading
-import queue
-from dataclasses import dataclass
-import os
-import sys
-import signal
-
-import numpy as np
 import pandas as pd
-from scapy.all import sniff, IP, TCP, UDP
-from joblib import load as joblib_load
+from collections import defaultdict, Counter
+from scapy.all import sniff, IP, TCP, UDP, Raw
 
-try:
-    import tensorflow as tf
-except Exception:
-    tf = None
+# --- Configuration ---
+INTERFACE = "Wi-Fi"      # Replace with your Wi-Fi interface name
+FLOW_TIMEOUT = 60         # seconds
+EXPORT_INTERVAL = 60
+CSV_FILENAME = "unsw_flows_full.csv"
 
-import requests
-import warnings
-warnings.filterwarnings("ignore", category=FutureWarning)
+# --- Global Flow storage ---
+flows = defaultdict(lambda: {
+    "proto": None, "state": None, "dur": 0,
+    "sbytes": 0, "dbytes": 0,
+    "sttl": [], "dttl": [],
+    "sloss": 0, "dloss": 0,
+    "service": None, "Sload": 0, "Dload": 0,
+    "Spkts": 0, "Dpkts": 0,
+    "swin": [], "dwin": [],
+    "stcpb": 0, "dtcpb": 0,
+    "smeansz": 0, "dmeansz": 0,
+    "trans_depth": 0, "res_bdy_len": 0,
+    "Sjit": [], "Djit": [],
+    "Stime": None, "Ltime": None,
+    "Sintpkt": [], "Dintpkt": [],
+    "tcprtt": None, "synack": 0, "ackdat": 0,
+    "is_sm_ips_ports": 0,
+    "ct_state_ttl": Counter(),
+    "ct_flw_http_mthd": Counter(),
+    "is_ftp_login": 0, "ct_ftp_cmd": Counter(),
+    "ct_srv_src": Counter(), "ct_srv_dst": Counter(),
+    "ct_dst_ltm": Counter(), "ct_src_ltm": Counter(),
+    "ct_src_dport_ltm": Counter(), "ct_dst_sport_ltm": Counter(),
+    "ct_dst_src_ltm": Counter(),
+    "prev_pkt_time_src": None,
+    "prev_pkt_time_dst": None,
+    "pkt_sizes_src": [],
+    "pkt_sizes_dst": [],
+    "syn_time": None,
+    "synack_time": None
+})
 
-# -----------------------
-# Config
-# -----------------------
-BATCH_MAX_FLOWS   = 128
-BATCH_MAX_SECONDS = 2.0
-FLOW_IDLE_TIMEOUT = 10.0
-MAX_FLOW_AGE      = 60.0
-
-MODE_LOCAL_SKLEARN = "local_sklearn"
-MODE_LOCAL_KERAS   = "local_keras"
-MODE_AZURE         = "azure"
-
-def now(): return time.time()
-
-# =======================
-# Flow aggregation
-# =======================
-@dataclass(frozen=True)
-class FlowKey:
-    src: str
-    sport: int
-    dst: str
-    dport: int
-    proto: str  # "TCP" / "UDP" / "OTHER"
-
-class FlowState:
-    __slots__ = (
-        "first_ts","last_ts","pkt_cnt","byte_cnt","lens","iat",
-        "tcp_flags","src","dst","sport","dport","proto"
-    )
-
-    def __init__(self, key: FlowKey, ts: float, pkt_len: int, flags: int|None):
-        self.first_ts = ts
-        self.last_ts  = ts
-        self.pkt_cnt  = 1
-        self.byte_cnt = pkt_len
-        self.lens     = [pkt_len]
-        self.iat      = []            # inter-arrival times
-        self.tcp_flags = {"syn":0,"ack":0,"fin":0,"rst":0,"psh":0,"urg":0}
-        if flags is not None:
-            self._accum_tcp_flags(flags)
-        self.src, self.dst = key.src, key.dst
-        self.sport, self.dport = key.sport, key.dport
-        self.proto = key.proto
-
-    def _accum_tcp_flags(self, flags: int):
-        if flags & 0x02: self.tcp_flags["syn"] += 1
-        if flags & 0x10: self.tcp_flags["ack"] += 1
-        if flags & 0x01: self.tcp_flags["fin"] += 1
-        if flags & 0x04: self.tcp_flags["rst"] += 1
-        if flags & 0x08: self.tcp_flags["psh"] += 1
-        if flags & 0x20: self.tcp_flags["urg"] += 1
-
-    def add_packet(self, ts: float, pkt_len: int, flags: int|None):
-        self.iat.append(max(ts - self.last_ts, 0.0))
-        self.last_ts = ts
-        self.pkt_cnt += 1
-        self.byte_cnt += pkt_len
-        self.lens.append(pkt_len)
-        if flags is not None:
-            self._accum_tcp_flags(flags)
-
-    def is_idle(self, ts: float, idle_timeout: float) -> bool:
-        return (ts - self.last_ts) >= idle_timeout
-
-    def age(self, ts: float) -> float:
-        return ts - self.first_ts
-
-    # ---- IMPORTANT ----
-    # Emit EXACT UNSW-NB15 FEATURE NAMES (inputs only; no 'attack_cat')
-    def to_feature_row(self):
-        duration = max(self.last_ts - self.first_ts, 0.0)
-        mean_len = float(np.mean(self.lens)) if self.lens else 0.0
-
-        # Map proto to lower-case strings used in training
-        proto_str = self.proto.lower() if self.proto else "other"
-        if proto_str not in ("tcp","udp","other"):
-            proto_str = "other"
-
-        row = {
-            # Categorical
-            "proto": proto_str,          # {'tcp','udp','other'} expected
-            "state": "FIN",              # default heuristic; adjust if you parse flags -> 'FIN','CON','INT',...
-            "service": "http",           # heuristic; replace with a detector if you have one
-
-            # Numeric (names EXACTLY as in your training set)
-            "dur": duration,
-            "sbytes": self.byte_cnt,     # simplistic; adjust if you track real s/d directions
-            "dbytes": self.byte_cnt,
-            "sttl": 64,
-            "dttl": 64,
-            "sloss": 0,
-            "dloss": 0,
-            "Sload": (self.byte_cnt / duration) if duration > 0 else 0.0,
-            "Dload": (self.byte_cnt / duration) if duration > 0 else 0.0,
-            "Spkts": self.pkt_cnt,
-            "Dpkts": self.pkt_cnt,
-            "swin": 255,
-            "dwin": 255,
-            "stcpb": sum(self.lens),
-            "dtcpb": sum(self.lens),
-            "smeansz": int(round(mean_len)) if mean_len else 0,
-            "dmeansz": int(round(mean_len)) if mean_len else 0,
-            "trans_depth": 1,
-            "res_bdy_len": 0,
-            "Sjit": float(np.std(self.iat)) if len(self.iat) > 1 else 0.0,
-            "Djit": float(np.std(self.iat)) if len(self.iat) > 1 else 0.0,
-            "Stime": int(self.first_ts),
-            "Ltime": int(self.last_ts),
-            "Sintpkt": float(np.mean(self.iat)) if self.iat else 0.0,
-            "Dintpkt": float(np.mean(self.iat)) if self.iat else 0.0,
-            "tcprtt": 0.0,
-            "synack": float(self.tcp_flags["syn"]),
-            "ackdat": float(self.tcp_flags["ack"]),
-            "is_sm_ips_ports": 0,
-            "ct_state_ttl": 1,
-            "ct_flw_http_mthd": 0,
-            "is_ftp_login": 0,
-            "ct_ftp_cmd": 0,
-            "ct_srv_src": 0,
-            "ct_srv_dst": 0,
-            "ct_dst_ltm": 0,
-            "ct_src_ ltm": 0,
-            "ct_src_dport_ltm": 0,
-            "ct_dst_sport_ltm": 0,
-            "ct_dst_src_ltm": 0,
-
-            # Identity columns (kept for printing)
-            "src": self.src,
-            "dst": self.dst,
-            "sport": self.sport,
-            "dport": self.dport,
-        }
-        return row
-
-class FlowTable:
-    def __init__(self):
-        self._flows: dict[FlowKey, FlowState] = {}
-        self._lock = threading.Lock()
-
-    def upsert(self, key: FlowKey, ts: float, pkt_len: int, flags: int|None):
-        with self._lock:
-            fs = self._flows.get(key)
-            if fs is None:
-                self._flows[key] = FlowState(key, ts, pkt_len, flags)
-            else:
-                fs.add_packet(ts, pkt_len, flags)
-
-    def collect_inactive(self, ts: float, idle_timeout=FLOW_IDLE_TIMEOUT, max_age=MAX_FLOW_AGE):
-        frozen = []
-        with self._lock:
-            to_del = []
-            for k, fs in self._flows.items():
-                if fs.is_idle(ts, idle_timeout) or fs.age(ts) >= max_age:
-                    frozen.append(fs)
-                    to_del.append(k)
-            for k in to_del:
-                del self._flows[k]
-        return frozen
-
-    def flush_all(self):
-        with self._lock:
-            frozen = list(self._flows.values())
-            self._flows.clear()
-        return frozen
-
-def scapy_to_flowkey(pkt):
+# --- Helper functions ---
+def get_flow_key(pkt):
     if IP not in pkt:
         return None
-    ip = pkt[IP]
-    proto = "OTHER"
-    sport = 0
-    dport = 0
-    flags = None
-    if TCP in pkt:
-        proto = "TCP"
-        sport = int(pkt[TCP].sport)
-        dport = int(pkt[TCP].dport)
-        flags = int(pkt[TCP].flags)
-    elif UDP in pkt:
-        proto = "UDP"
-        sport = int(pkt[UDP].sport)
-        dport = int(pkt[UDP].dport)
-    key = FlowKey(ip.src, sport, ip.dst, dport, proto)
-    pkt_len = len(pkt)
-    ts = float(pkt.time)
-    return key, (ts, pkt_len, flags)
+    src = pkt[IP].src
+    dst = pkt[IP].dst
+    proto = pkt.getlayer(TCP) and "TCP" or (pkt.getlayer(UDP) and "UDP" or str(pkt.proto))
+    sport = pkt[TCP].sport if TCP in pkt else (pkt[UDP].sport if UDP in pkt else 0)
+    dport = pkt[TCP].dport if TCP in pkt else (pkt[UDP].dport if UDP in pkt else 0)
+    return tuple(sorted([(src, sport), (dst, dport)]) + [proto])
 
-# =======================
-# Preprocessor
-# =======================
-class Preprocessor:
-    """
-    Loads:
-      - encoder.pkl: the ColumnTransformer you saved (OneHot on ['proto','service','state'], remainder='passthrough')
-      - scaler.pkl:  StandardScaler fitted on the numeric columns
-    It scales numerics (same order as during fit) and then calls encoder.transform(df)
-    """
-    # Exact UNSW-NB15 input schema (43 inputs)
-    CAT_COLS = ["proto", "service", "state"]
-    ALL_INPUT_COLS = [
-        "proto","state","dur","sbytes","dbytes","sttl","dttl","sloss","dloss","service",
-        "Sload","Dload","Spkts","Dpkts","swin","dwin","stcpb","dtcpb","smeansz","dmeansz",
-        "trans_depth","res_bdy_len","Sjit","Djit","Stime","Ltime","Sintpkt","Dintpkt",
-        "tcprtt","synack","ackdat","is_sm_ips_ports","ct_state_ttl","ct_flw_http_mthd",
-        "is_ftp_login","ct_ftp_cmd","ct_srv_src","ct_srv_dst","ct_dst_ltm","ct_src_ ltm",
-        "ct_src_dport_ltm","ct_dst_sport_ltm","ct_dst_src_ltm"
-    ]
+def detect_service(pkt):
+    if TCP in pkt and pkt[TCP].dport in [80, 8080]:
+        return "HTTP"
+    elif TCP in pkt and pkt[TCP].dport in [21]:
+        return "FTP"
+    elif UDP in pkt and pkt[UDP].dport in [53]:
+        return "DNS"
+    return None
 
-    def __init__(self, encoder_path: str, scaler_path: str):
-        if not os.path.exists(encoder_path):
-            raise FileNotFoundError(f"Missing encoder at {encoder_path}")
-        if not os.path.exists(scaler_path):
-            raise FileNotFoundError(f"Missing scaler at {scaler_path}")
+def process_packet(pkt):
+    key = get_flow_key(pkt)
+    if key is None:
+        return
+    flow = flows[key]
+    now = time.time()
+    size = len(pkt)
+    if flow["Stime"] is None:
+        flow["Stime"] = now
+        flow["proto"] = key[2]
+        flow["service"] = detect_service(pkt)
+    flow["Ltime"] = now
+    flow["dur"] = flow["Ltime"] - flow["Stime"]
 
-        self.encoder = joblib_load(encoder_path)  # ColumnTransformer (as saved in training)
-        self.scaler  = joblib_load(scaler_path)   # StandardScaler on numeric cols
+    src_ip = pkt[IP].src
+    dst_ip = pkt[IP].dst
 
-        # Use the trained numeric column order from scaler
-        self.numeric_cols = list(getattr(self.scaler, "feature_names_in_", []))
-        if not self.numeric_cols:
-            raise RuntimeError("scaler.pkl has no feature_names_in_. Please save a fitted scaler.")
-
-        # ColumnTransformer should know feature names too
-        if not hasattr(self.encoder, "transform"):
-            raise RuntimeError("encoder.pkl does not look like a ColumnTransformer.")
-
-    def transform(self, df: pd.DataFrame) -> np.ndarray:
-        df = df.copy()
-
-        # Ensure all expected input columns exist; add missing with neutral defaults
-        for col in self.ALL_INPUT_COLS:
-            if col not in df.columns:
-                # sensible defaults
-                df[col] = 0 if col not in self.CAT_COLS else "UNKNOWN"
-
-        # Drop any extra columns the model didn't see (except identities we keep for printing elsewhere)
-        df = df[self.ALL_INPUT_COLS + ["src","dst","sport","dport"] if set(["src","dst","sport","dport"]).issubset(df.columns) else self.ALL_INPUT_COLS]
-
-        # Scale numeric columns in the SAME ORDER as during fit
-        for c in self.numeric_cols:
-            if c not in df.columns:
-                df[c] = 0
-        df[self.numeric_cols] = self.scaler.transform(df[self.numeric_cols])
-
-        # The ColumnTransformer expects full frame with cat + (already scaled) numerics
-        X = self.encoder.transform(df[self.ALL_INPUT_COLS])
-        # If the encoder returns sparse, make it dense (sklearn >=1.4 often returns ndarray)
-        if hasattr(X, "toarray"):
-            X = X.toarray()
-        return X
-
-# =======================
-# Predictor
-# =======================
-class Predictor:
-    def __init__(self, mode=MODE_LOCAL_SKLEARN, model_path=None, keras_path=None,
-                 azure_url=None, azure_key=None, timeout=3.0):
-        self.mode = mode
-        self.timeout = timeout
-        self.session = requests.Session()
-        self.sklearn_model = None
-        self.keras_model = None
-        self.azure_url = azure_url
-        self.azure_key = azure_key
-
-        if self.mode == MODE_LOCAL_SKLEARN:
-            if not model_path or not os.path.exists(model_path):
-                raise FileNotFoundError(f"Missing sklearn model at {model_path}")
-            self.sklearn_model = joblib_load(model_path)
-        elif self.mode == MODE_LOCAL_KERAS:
-            if tf is None:
-                raise RuntimeError("TensorFlow not installed")
-            if not keras_path or not os.path.exists(keras_path):
-                raise FileNotFoundError(f"Missing Keras model at {keras_path}")
-            self.keras_model = tf.keras.models.load_model(keras_path)
-        elif self.mode == MODE_AZURE:
-            if not azure_url:
-                raise ValueError("Azure URL required")
-
-    def predict(self, X: np.ndarray):
-        if self.mode == MODE_LOCAL_SKLEARN:
-            return self.sklearn_model.predict(X).tolist()
-        if self.mode == MODE_LOCAL_KERAS:
-            probs = self.keras_model.predict(X, verbose=0)
-            return (np.argmax(probs, axis=1) if probs.ndim == 2 else (probs > 0.5).astype(int).ravel()).tolist()
-        if self.mode == MODE_AZURE:
-            headers = {"Content-Type": "application/json"}
-            if self.azure_key:
-                headers["Authorization"] = f"Bearer {self.azure_key}"
-            resp = self.session.post(self.azure_url, headers=headers, json={"data": X.tolist()}, timeout=self.timeout)
-            resp.raise_for_status()
-            out = resp.json()
-            return out.get("prediction", out)
-        raise RuntimeError("Invalid prediction mode")
-
-# =======================
-# Threads
-# =======================
-def sniffer_thread(iface: str, flow_table: FlowTable, stop_event: threading.Event):
-    def onpkt(pkt):
-        res = scapy_to_flowkey(pkt)
-        if res is None: return
-        key, (ts, pkt_len, flags) = res
-        flow_table.upsert(key, ts, pkt_len, flags)
-
-    sniff_kwargs = dict(store=False, prn=onpkt, iface=iface)
-    while not stop_event.is_set():
-        try:
-            sniff(timeout=1, **sniff_kwargs)
-        except Exception as e:
-            print(f"[sniffer] error: {e}", file=sys.stderr)
-            time.sleep(0.5)
-
-def collector_thread(flow_table: FlowTable, batch_q: queue.Queue, stop_event: threading.Event):
-    last_emit = now()
-    batch = []
-    while not stop_event.is_set():
-        time.sleep(0.2)
-        frozen = flow_table.collect_inactive(now())
-        for fs in frozen:
-            batch.append(fs.to_feature_row())
-        if batch and (len(batch) >= BATCH_MAX_FLOWS or (now() - last_emit) >= BATCH_MAX_SECONDS):
-            batch_q.put(pd.DataFrame(batch))
-            batch = []
-            last_emit = now()
-    rem = flow_table.flush_all()
-    if rem:
-        batch_q.put(pd.DataFrame([fs.to_feature_row() for fs in rem]))
-
-# Définir les labels globaux
-LABELS = ['Normal', 'Reconnaissance', 'Backdoor', 'DoS', 'Exploits',
-          'Analysis', 'Fuzzers', 'Worms', 'Shellcode', 'Generic']
-
-def inference_thread(batch_q: queue.Queue, preproc: Preprocessor, predictor: Predictor,
-                     stop_event: threading.Event, print_labels=True):
-    while not stop_event.is_set():
-        try:
-            df = batch_q.get(timeout=0.5)
-        except queue.Empty:
-            continue
-        if df.empty:
-            continue
-
-        # Keep identity columns for printing
-        ident_cols = ["src","dst","sport","dport","proto"]
-        view = df[ident_cols].copy() if set(ident_cols).issubset(df.columns) else None
-
-        # Preprocess
-        try:
-            X = preproc.transform(df)
-        except Exception as e:
-            print(f"[preprocess] error: {e}", file=sys.stderr)
-            continue
-
-        # Predict
-        try:
-            y = predictor.predict(X)  # retourne des indices 0-9
-            # Mapper les indices vers les labels
-            y_labels = [LABELS[i] if i < len(LABELS) else "Unknown" for i in y]
-        except Exception as e:
-            print(f"[predict] error: {e}", file=sys.stderr)
-            continue
-
-        if print_labels and view is not None:
-            out = view.copy()
-            out["pred_label"] = y_labels
-            print(out.head(20).to_string(index=False))
+    # TTL and Window sizes
+    if hasattr(pkt[IP], "ttl"):
+        if src_ip == key[0][0]:
+            flow["sttl"].append(pkt[IP].ttl)
+            if TCP in pkt:
+                flow["swin"].append(pkt[TCP].window)
         else:
-            print(f"[predict] batch size={len(y_labels)}")
+            flow["dttl"].append(pkt[IP].ttl)
+            if TCP in pkt:
+                flow["dwin"].append(pkt[TCP].window)
 
-# =======================
-# Main
-# =======================
-def main():
-    parser = argparse.ArgumentParser(description="Realtime IDS streaming (UNSW-NB15 features)")
-    parser.add_argument("--iface", required=True, help="Network interface to sniff")
-    parser.add_argument("--encoder", default="encoder.pkl", help="ColumnTransformer (OneHot on cats)")
-    parser.add_argument("--scaler",  default="scaler.pkl",  help="StandardScaler on numeric features")
-    parser.add_argument("--mode", choices=[MODE_LOCAL_SKLEARN, MODE_LOCAL_KERAS, MODE_AZURE],
-                        default=MODE_LOCAL_SKLEARN)
-    parser.add_argument("--sk_model", default="rf_model.pkl")
-    parser.add_argument("--keras_model", default="cnn_lstm_model.h5")
-    parser.add_argument("--azure_url", default=None)
-    parser.add_argument("--azure_key", default=None)
-    args = parser.parse_args()
+    # Directional stats
+    if src_ip == key[0][0]:
+        flow["sbytes"] += size
+        flow["Spkts"] += 1
+        flow["pkt_sizes_src"].append(size)
+        if flow["prev_pkt_time_src"]:
+            flow["Sintpkt"].append(now - flow["prev_pkt_time_src"])
+        flow["prev_pkt_time_src"] = now
+        if TCP in pkt:
+            flow["stcpb"] += len(pkt[TCP].payload)
+            if pkt[TCP].flags & 0x02:  # SYN
+                flow["syn_time"] = now
+        if Raw in pkt and flow["service"]=="HTTP":
+            payload = pkt[Raw].load.decode(errors="ignore")
+            for m in ["GET", "POST", "PUT", "DELETE"]:
+                if payload.startswith(m):
+                    flow["ct_flw_http_mthd"][m] += 1
+                    flow["trans_depth"] += 1
+            flow["res_bdy_len"] += len(payload)
+    else:
+        flow["dbytes"] += size
+        flow["Dpkts"] += 1
+        flow["pkt_sizes_dst"].append(size)
+        if flow["prev_pkt_time_dst"]:
+            flow["Dintpkt"].append(now - flow["prev_pkt_time_dst"])
+        flow["prev_pkt_time_dst"] = now
+        if TCP in pkt:
+            flow["dtcpb"] += len(pkt[TCP].payload)
+            if pkt[TCP].flags & 0x12:  # SYN-ACK
+                flow["synack"] += 1
+                if flow["syn_time"]:
+                    flow["tcprtt"] = now - flow["syn_time"]
+            if pkt[TCP].flags & 0x10:  # ACK
+                flow["ackdat"] += 1
 
-    try:
-        preproc = Preprocessor(args.encoder, args.scaler)
-        predictor = Predictor(args.mode, args.sk_model, args.keras_model, args.azure_url, args.azure_key)
-    except Exception as e:
-        print(f"[init] {e}", file=sys.stderr)
-        sys.exit(1)
+    # Compute mean sizes
+    flow["smeansz"] = sum(flow["pkt_sizes_src"]) / max(1, len(flow["pkt_sizes_src"]))
+    flow["dmeansz"] = sum(flow["pkt_sizes_dst"]) / max(1, len(flow["pkt_sizes_dst"]))
 
-    flow_table = FlowTable()
-    batch_q = queue.Queue()
-    stop_event = threading.Event()
+# --- Periodic export ---
+def export_flows():
+    data = []
+    for f in flows.values():
+        row = f.copy()
+        row["Sttl"] = sum(f["sttl"])/max(1,len(f["sttl"])) if f["sttl"] else 0
+        row["Dttl"] = sum(f["dttl"])/max(1,len(f["dttl"])) if f["dttl"] else 0
+        row["Swin"] = sum(f["swin"])/max(1,len(f["swin"])) if f["swin"] else 0
+        row["Dwin"] = sum(f["dwin"])/max(1,len(f["dwin"])) if f["dwin"] else 0
+        row["Sintpkt"] = sum(f["Sintpkt"])/max(1,len(f["Sintpkt"])) if f["Sintpkt"] else 0
+        row["Dintpkt"] = sum(f["Dintpkt"])/max(1,len(f["Dintpkt"])) if f["Dintpkt"] else 0
+        data.append(row)
+    df = pd.DataFrame(data)
+    df.to_csv(CSV_FILENAME, index=False)
+    print(f"[INFO] Exported {len(data)} flows to {CSV_FILENAME}")
 
-    def handle_sig(sig, frame):
-        print("\n[main] stopping...")
-        stop_event.set()
-    signal.signal(signal.SIGINT, handle_sig)
-    signal.signal(signal.SIGTERM, handle_sig)
+def periodic_export():
+    while True:
+        time.sleep(EXPORT_INTERVAL)
+        export_flows()
 
-    t_sniff = threading.Thread(target=sniffer_thread, args=(args.iface, flow_table, stop_event), daemon=True)
-    t_coll  = threading.Thread(target=collector_thread, args=(flow_table, batch_q, stop_event), daemon=True)
-    t_infer = threading.Thread(target=inference_thread, args=(batch_q, preproc, predictor, stop_event), daemon=True)
+def cleanup_flows():
+    while True:
+        time.sleep(FLOW_TIMEOUT)
+        now = time.time()
+        keys_to_remove = [k for k,f in flows.items() if f["Ltime"] and now - f["Ltime"]>FLOW_TIMEOUT]
+        for k in keys_to_remove:
+            del flows[k]
 
-    t_sniff.start(); t_coll.start(); t_infer.start()
-    print(f"[main] running on iface={args.iface} mode={args.mode}")
-    print("[main] press Ctrl+C to stop")
+# --- Start background threads ---
+threading.Thread(target=periodic_export, daemon=True).start()
+threading.Thread(target=cleanup_flows, daemon=True).start()
 
-    try:
-        while not stop_event.is_set():
-            time.sleep(0.5)
-    finally:
-        stop_event.set()
-
-if __name__ == "__main__":
-    main()
+# --- Start live capture ---
+print(f"[INFO] Starting live capture on {INTERFACE} ... (Run as Administrator!)")
+sniff(iface=INTERFACE, prn=process_packet, store=False)

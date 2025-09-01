@@ -25,8 +25,9 @@ LABEL_COLORS = {
 # =======================
 parser = argparse.ArgumentParser(description="Real-time IDS")
 parser.add_argument("--iface", type=str, required=True, help="Network interface to sniff")
-parser.add_argument("--model", type=str, required=True, choices=["rf", "knn", "autoencoder", "hybrid"],
-                    help="Choose model: rf, knn, autoencoder, hybrid")
+parser.add_argument("--model", type=str, required=True, choices=["rf", "knn", "autoencoder", "hybrid", "dt"],
+                    help="Choose model: rf, knn, autoencoder, hybrid, dt")
+
 args = parser.parse_args()
 IFACE = args.iface
 MODEL_CHOICE = args.model.lower()
@@ -69,6 +70,16 @@ elif MODEL_CHOICE == "hybrid":
     encoders = joblib.load("onehot_encoder.pkl")
     categorical_cols = ["protocol_type", "service", "flag"]
     attack_map = ['probe', 'dos', 'normal', 'r2l', 'u2r']
+
+elif MODEL_CHOICE == "dt":
+    dt_rfe = joblib.load("dt_selected_features_model.pkl")  # Modèle Decision Tree avec RFE
+    rfe_selector = joblib.load("rfe_selector.pkl")          # Sélecteur RFE
+    le_protocol = joblib.load("le_protocol.pkl")
+    le_service  = joblib.load("le_service.pkl")
+    le_flag     = joblib.load("le_flag.pkl")
+    categorical_cols = ["protocol_type", "service", "flag"]
+    attack_map = ['normal', 'dos', 'probe', 'r2l', 'u2r']
+
 
 else:
     raise ValueError("Unsupported model choice!")
@@ -158,6 +169,13 @@ def preprocess_hybrid(df):
         X_scaled = np.hstack([X_scaled, padding])
     return X_scaled.astype(np.float32)
 
+def preprocess_dt(df):
+    df['protocol_type'] = le_protocol.transform(df['protocol_type'])
+    df['service']       = le_service.transform(df['service'])
+    df['flag']          = le_flag.transform(df['flag'])
+    return rfe_selector.transform(df)
+
+
 # =======================
 # 6. Packet prediction
 # =======================
@@ -194,6 +212,11 @@ def predict_packet(pkt):
             encoded = encoder_model.predict(X, verbose=0)
             y_pred_enc = rf_model.predict(encoded)
             label = attack_map[y_pred_enc[0]]
+        elif MODEL_CHOICE == "dt":
+            X = preprocess_dt(df)
+            y_pred_enc = dt_rfe.predict(X)
+            label = attack_map[y_pred_enc[0]]
+
         else:
             label = "unknown"
 
